@@ -6,9 +6,6 @@ from __future__ import annotations
 import os
 import re
 
-import isaaclab.sim as sim_utils
-from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg
 
 from .constants import (  # noqa: F401  (re-export，其他模块从这里拿常量)
     ACTION_CLIP,
@@ -65,139 +62,60 @@ def asset_dir() -> str:
 
 
 def usd_path(no_gimbal: bool = False) -> str:
-    """无云台版优先（云台不需要，少 2 个 DOF 也更省事）。"""
-    forced = os.environ.get("WHEELBIPE_USD")
-    if forced:
-        if not os.path.exists(forced):
-            raise FileNotFoundError(f"WHEELBIPE_USD 指向的文件不存在: {forced}")
-        return forced
-    d = asset_dir()
-    order = ["wheelbipeV14_2_1/wheelbipeV14_2_ng.usd", "wheelbipeV14_2_1/wheelbipeV14_2.usd"]
-    if not no_gimbal:
-        order = order[::-1]
-    for rel in order:
-        p = os.path.join(d, rel.replace("/", os.sep))
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(f"{d} 下找不到 wheelbipeV14_2 的 USD")
+    """Compatibility name retained for callers, now returning the MJCF asset."""
+    return mjcf_path()
 
 
-# 执行器/物理参数
-DM8009_ARMATURE = 1.95e-04 * 9.0 * 9.0  # 与 wheeled-legged_RL 保持一致
+# MJLab robot entity configuration. Actuator gains and limits stay in the
+# converted MJCF so sim2sim and training use the same actuator model.
+def mjcf_path() -> str:
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "assets", "mujoco", "wheelbipe_v14_2.xml")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"找不到 MJCF: {path}。先运行 `uv run python tools/usd2mjcf.py --fk-json`。"
+        )
+    return path
 
 
-# ArticulationCfg
-def _usd_joint_names(usd: str) -> list[str]:
-    """从 USD 里读出所有 physics joint 的名字，用来过滤执行器正则。"""
-    try:
-        from pxr import Usd, UsdPhysics
+def make_robot_cfg(usd: str | None = None, prim_path: str | None = None):
+    """Build an MJLab entity from the converted wheelbipe MJCF."""
+    import mujoco
+    from mjlab.actuator import XmlActuatorCfg
+    from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 
-        stage = Usd.Stage.Open(usd)
-        names = []
-        for prim in stage.Traverse():
-            if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
-                names.append(prim.GetName())
-        return names
-    except Exception as e:  # noqa: BLE001
-        print(f"[robot] 读 USD 关节名失败（{e}），执行器按完整正则配置")
-        return []
-
-
-def _act(patterns, names, cls=IdealPDActuatorCfg, effort=None, velocity=None, **kw):
-    """按真实关节名裁剪正则；整组都不匹配则返回 None（该执行器不建）。"""
-    pats = list(patterns)
-    if names:
-        pats = [p for p in pats if any(re.fullmatch(p, n) for n in names)]
-        if not pats:
-            return None
-        for k, v in list(kw.items()):
-            if isinstance(v, dict):
-                kw[k] = {pk: pv for pk, pv in v.items() if any(re.fullmatch(pk, n) for n in names)}
-    if effort is not None:
-        kw["effort_limit"] = effort
-        kw["effort_limit_sim"] = effort
-    if velocity is not None:
-        kw["velocity_limit"] = velocity
-        kw["velocity_limit_sim"] = velocity
-    return cls(joint_names_expr=pats, **kw)
-
-
-def make_robot_cfg(usd: str | None = None, prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCfg:
-    """执行器/物理参数逐项照抄 ``wheeled-legged_RL/.../wheelbipe_V14_2.py``。"""
-    usd = usd or usd_path()
-    names = _usd_joint_names(usd)
-    groups = [
-        # 4 个主动腿关节（位置伺服，对应动作 a[:4]）
-        (
-            "legs_act",
-            _act(
-                [".*_rear1_joint", ".*_front1_joint"], names,
-                stiffness={".*_rear1_joint": 60.0, ".*_front1_joint": 60.0},
-                damping={".*_rear1_joint": 2.0, ".*_front1_joint": 2.0},
-                effort=40.0, velocity=17.0, armature=DM8009_ARMATURE,
-            ),
+    source = usd if usd and usd.endswith(".xml") else mjcf_path()
+    actuators = (
+        XmlActuatorCfg(
+            target_names_expr=(".*_front1_joint", ".*_rear1_joint", "gimbal_.*_joint"),
+            command_field="position",
         ),
-        # 被动连杆 + 直线导轨：只留极小阻尼
-        (
-            "legs_inact",
-            _act(
-                [".*_rear2_joint", ".*_front2_joint", ".*_front3_joint", ".*_front4_joint",
-                 ".*_spring1_joint", ".*_guide_joint"], names,
-                stiffness=0.0, damping=0.01, effort=50.0, velocity=300.0, armature=1e-4,
-            ),
+        XmlActuatorCfg(
+            target_names_expr=(".*_wheel_joint",),
+            command_field="velocity",
         ),
-        # 轮速伺服必须用 ImplicitActuatorCfg，IdealPD 保持 20 ms 力矩会让低惯量轮子振荡到 ±50 rad/s
-        (
-            "wheel",
-            _act([".*_wheel_joint"], names, damping=WHEEL_VEL_KD,
-                 stiffness=0.0, effort=WHEEL_EFFORT, velocity=60.0, armature=0.0),
+        XmlActuatorCfg(
+            target_names_expr=(".*_spring2_joint",),
+            command_field="effort",
         ),
-        # 弹簧滑块：每个控制步用 set_joint_effort_target 打力，所以这里只给阻尼
-        (
-            "spring",
-            _act([".*_spring2_joint"], names,
-                 stiffness=0.0, damping=50.0, effort=1000.0, velocity=50.0, armature=1e-4),
+    )
+    def load_entity_spec():
+        spec = mujoco.MjSpec.from_file(source)
+        spec.option.timestep = 0.002
+        spec.option.tolerance = 1e-8
+        spec.option.impratio = 1.0
+        spec.option.integrator = int(mujoco.mjtIntegrator.mjINT_EULER)
+        spec.option.cone = int(mujoco.mjtCone.mjCONE_PYRAMIDAL)
+        return spec
+
+    return EntityCfg(
+        spec_fn=load_entity_spec,
+        init_state=EntityCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.38),
+            joint_pos={".*": 0.0},
+            joint_vel={".*": 0.0},
         ),
-        # 云台（只有带云台的 USD 才有；不进动作/状态，只做伺服+阻尼）
-        (
-            "gimbal_yaw",
-            _act(["gimbal_yaw_joint"], names,
-                 stiffness=0.0, damping=0.5, effort=2.0, velocity=30.0, armature=1e-4),
-        ),
-        (
-            "gimbal_pitch",
-            _act(["gimbal_pitch_joint"], names,
-                 stiffness=20.0, damping=0.5, effort=10.0, velocity=30.0, armature=1e-4),
-        ),
-    ]
-    actuators = {k: v for k, v in groups if v is not None}
-    return ArticulationCfg(
-        prim_path=prim_path,
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=usd,
-            activate_contact_sensors=False,
-            copy_from_source=True,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
-                retain_accelerations=False,
-                linear_damping=0.0,
-                angular_damping=0.0,
-                max_linear_velocity=1000.0,
-                max_angular_velocity=1000.0,
-                max_depenetration_velocity=1.0,
-            ),
-            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                fix_root_link=False,
-                enabled_self_collisions=False,
-                solver_position_iteration_count=12,
-                solver_velocity_iteration_count=6,
-            ),
-        ),
-        # 显式把初始关节角写成 0：默认姿态 = 腿全伸直的姿态，重置高度由 FK 估计
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.38), joint_pos={".*": 0.0}, joint_vel={".*": 0.0}
-        ),
-        actuators=actuators,
+        articulation=EntityArticulationInfoCfg(actuators=actuators),
     )
 
 

@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""批量仿真器（Isaac Sim / Isaac Lab 2.x + PhysX）：施加动作 -> 步进 -> 用解析奖励打标签。"""
+"""批量 MuJoCo Warp 仿真环境，供 SuperMimic 训练与评估复用。"""
 
 from __future__ import annotations
 
 import torch
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
-from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-from isaaclab.sim import SimulationContext
-from isaaclab.utils import configclass
+from mjlab.scene import Scene, SceneCfg
+from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
 from .mdp import MAX_STEP_REWARD
 from .robot import (
@@ -29,78 +26,180 @@ from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
 
 def _t(v):
-    """兼容 Isaac Lab 2.x（直接是 Tensor）与 3.x（.torch 包装）。"""
+    """兼容 Tensor 与带 .torch 属性的数组包装。"""
     return v.torch if hasattr(v, "torch") else v
 
 
-def _replace_cfg(obj, **kw):
-    """浅拷贝 cfg 并改字段（Isaac Lab 2.3 的 isaaclab.utils 里没有 replace）。"""
-    import copy
-
-    out = copy.copy(obj)
-    for k, v in kw.items():
-        setattr(out, k, v)
-    return out
-
-
 # 场景 / 物理
-def make_material(friction: float = 1.0) -> sim_utils.RigidBodyMaterialCfg:
-    return sim_utils.RigidBodyMaterialCfg(
-        friction_combine_mode="multiply",
-        restitution_combine_mode="multiply",
-        static_friction=friction,
-        dynamic_friction=friction,
-        restitution=0.0,
-    )
-
-
-def make_sim_cfg(device: str, friction: float = 1.0) -> sim_utils.SimulationCfg:
-    """与原项目 ``wheelbipe25_v3/env_cfg.py`` 的 SimulationCfg 完全一致。"""
-    return sim_utils.SimulationCfg(
-        dt=SIM_DT,
-        render_interval=DECIMATION,
-        device=device,
-        physics_material=make_material(friction),
-    )
-
-
-def make_scene_cfg(num_envs: int, robot_cfg, env_spacing: float = 2.0, friction: float = 1.0):
-    @configclass
-    class _Cfg(InteractiveSceneCfg):
-        # 地面材质要和原项目一致（乘性混合，μ=1.0），否则轮子会打滑
-        ground = AssetBaseCfg(
-            prim_path="/World/ground",
-            spawn=sim_utils.GroundPlaneCfg(physics_material=make_material(friction)),
+def make_sim_cfg(device: str, friction: float = 1.0):
+    cfg = SimulationCfg(
+        mujoco=MujocoCfg(
+            timestep=SIM_DT,
+            integrator="implicitfast",
+            solver="newton",
+            iterations=100,
+            tolerance=1e-10,
+            cone="elliptic",
+            impratio=10.0,
         )
-        # 灯光：USD 里没有光源，缺了它就是一片黑（录视频/看画面时必须要有）
-        light = AssetBaseCfg(
-            prim_path="/World/light",
-            spawn=sim_utils.DomeLightCfg(intensity=2500.0, color=(0.92, 0.92, 0.95)),
+    )
+    cfg.device = device
+    cfg.friction = friction
+    return cfg
+
+
+class _SimulationAdapter:
+    """Keep the repository's step(render=...) call shape over MJLab Simulation."""
+
+    def __init__(self, simulation):
+        self._simulation = simulation
+
+    def __getattr__(self, name):
+        return getattr(self._simulation, name)
+
+    def step(self, render: bool = False):
+        self._simulation.step()
+
+    def set_camera_view(self, *args, **kwargs):
+        return None
+
+    def render(self):
+        return None
+
+
+class _EntityDataAdapter:
+    _JOINT_FIELDS = {
+        "joint_pos",
+        "joint_vel",
+        "default_joint_pos",
+        "joint_pos_limits",
+        "default_joint_pos_limits",
+        "soft_joint_pos_limits",
+    }
+
+    def __init__(self, data, joint_ids):
+        self._data = data
+        self._joint_ids = joint_ids
+
+    def __getattr__(self, name):
+        value = getattr(self._data, name)
+        if name in self._JOINT_FIELDS:
+            return value[:, self._joint_ids]
+        return value
+
+
+class _EntityAdapter:
+    # This canonical order is stored in the shipped SuperMimic checkpoints.
+    # MJLab's entity order differs, so map every state and target by joint name.
+    POLICY_JOINT_NAMES = (
+        "gimbal_yaw_joint",
+        "left_bottom1_guide_joint", "left_bottom2_guide_joint",
+        "left_bottom3_guide_joint", "left_bottom4_guide_joint",
+        "left_front1_guide_joint", "left_front1_joint", "left_front_guide_joint",
+        "left_rear1_joint", "left_rear_guide_joint",
+        "right_bottom1_guide_joint", "right_bottom2_guide_joint",
+        "right_bottom3_guide_joint", "right_bottom4_guide_joint",
+        "right_front1_guide_joint", "right_front1_joint", "right_front_guide_joint",
+        "right_rear1_joint", "right_rear_guide_joint", "gimbal_pitch_joint",
+        "left_front2_joint", "left_rear2_joint", "left_spring1_joint",
+        "right_front2_joint", "right_rear2_joint", "right_spring1_joint",
+        "left_front3_joint", "left_rear2_guide_joint", "left_wheel_joint",
+        "left_spring2_joint", "right_front3_joint", "right_rear2_guide_joint",
+        "right_wheel_joint", "right_spring2_joint", "left_front4_joint",
+        "right_front4_joint",
+    )
+    def __init__(self, entity, num_envs: int, device: str):
+        self._entity = entity
+        self.num_instances = num_envs
+        self.device = device
+        available = {name: i for i, name in enumerate(entity.joint_names)}
+        self.joint_names = tuple(name for name in self.POLICY_JOINT_NAMES if name in available)
+        missing = set(self.POLICY_JOINT_NAMES) - set(available)
+        if missing:
+            raise RuntimeError(f"MJCF 缺少检查点关节: {sorted(missing)}")
+        self._joint_ids = torch.tensor(
+            [available[name] for name in self.joint_names], dtype=torch.long, device=device
+        )
+        self._joint_id_map = {name: i for i, name in enumerate(entity.joint_names)}
+        self.data = _EntityDataAdapter(entity.data, self._joint_ids)
+
+    def __getattr__(self, name):
+        return getattr(self._entity, name)
+
+    def write_root_pose_to_sim(self, pose, env_ids=None):
+        return self._entity.write_root_link_pose_to_sim(pose, env_ids)
+
+    def write_root_velocity_to_sim(self, velocity, env_ids=None):
+        return self._entity.write_root_link_velocity_to_sim(velocity, env_ids)
+
+    def write_joint_state_to_sim(self, position, velocity, joint_ids=None, env_ids=None):
+        if joint_ids is not None:
+            mapped = self._joint_ids[joint_ids]
+            return self._entity.write_joint_state_to_sim(position, velocity, mapped, env_ids)
+        full_position = torch.zeros(
+            position.shape[0], len(self._entity.joint_names), dtype=position.dtype, device=position.device
+        )
+        full_velocity = torch.zeros_like(full_position)
+        full_position[:, self._joint_ids] = position
+        full_velocity[:, self._joint_ids] = velocity
+        return self._entity.write_joint_state_to_sim(full_position, full_velocity, env_ids=env_ids)
+
+    def _map_joint_ids(self, joint_ids):
+        if joint_ids is None:
+            return None
+        return self._joint_ids[joint_ids]
+
+    def set_joint_position_target(self, target, joint_ids=None, env_ids=None):
+        return self._entity.set_joint_position_target(
+            target, joint_ids=self._map_joint_ids(joint_ids), env_ids=env_ids
         )
 
-        robot = _replace_cfg(robot_cfg, prim_path="{ENV_REGEX_NS}/Robot")
+    def set_joint_velocity_target(self, target, joint_ids=None, env_ids=None):
+        return self._entity.set_joint_velocity_target(
+            target, joint_ids=self._map_joint_ids(joint_ids), env_ids=env_ids
+        )
 
-    kwargs = dict(num_envs=num_envs, env_spacing=env_spacing, replicate_physics=True)
-    try:
-        return _Cfg(**kwargs, filter_collisions=True)
-    except TypeError:
-        return _Cfg(**kwargs)
+    def set_joint_effort_target(self, target, joint_ids=None, env_ids=None):
+        return self._entity.set_joint_effort_target(
+            target, joint_ids=self._map_joint_ids(joint_ids), env_ids=env_ids
+        )
 
 
 def make_world(sim_cfg, num_envs: int, robot_cfg, env_spacing: float = 2.0):
-    """先建 sim+scene，再从中读出关节名，才能建 spec / MDP / 世界模型。"""
-    mat = getattr(sim_cfg, "physics_material", None)
-    fr = float(getattr(mat, "static_friction", 1.0) or 1.0)
-    # 关键：机器人也要显式绑定材质。USD 自带材质 μ 可能是 0，而 combine="multiply" 时
-    # 0 × 任何值 = 0 —— 轮子会空转到 58 rad/s 而车身不动的"无摩擦"现象就是这么来的。
-    try:
-        robot_cfg.spawn.physics_material = make_material(fr)
-    except Exception:  # noqa: BLE001
-        pass
-    sim = SimulationContext(sim_cfg)
-    scene = InteractiveScene(make_scene_cfg(num_envs, robot_cfg, env_spacing, fr))
-    sim.reset()
-    return sim, scene, scene["robot"]
+    """Build the wheelbipe scene and vectorized Warp simulation with MJLab."""
+    device = getattr(sim_cfg, "device", "cuda:0")
+    def configure_scene(spec):
+        spec.option.timestep = SIM_DT
+        spec.option.integrator = 1
+        spec.option.solver = 2
+        spec.option.iterations = 100
+        spec.option.tolerance = 1e-10
+        spec.option.cone = 1
+        spec.option.impratio = 10.0
+
+    scene = Scene(
+        SceneCfg(
+            num_envs=num_envs,
+            env_spacing=env_spacing,
+            entities={"robot": robot_cfg},
+            spec_fn=configure_scene,
+        ),
+        device=device,
+    )
+    model = scene.compile()
+    friction = float(getattr(sim_cfg, "friction", 1.0))
+    if friction != 1.0:
+        import numpy as np
+        model.geom_friction[:, 0] *= friction
+    simulation = Simulation(num_envs, sim_cfg, model=model, device=device)
+    if abs(simulation.mj_model.opt.timestep - SIM_DT) > 1e-10:
+        raise RuntimeError(
+            f"MJLab physics step is {simulation.mj_model.opt.timestep}, expected {SIM_DT} seconds"
+        )
+    scene.initialize(simulation.mj_model, simulation.model, simulation.data)
+    simulation.reset()
+    scene.update(0.0)
+    return _SimulationAdapter(simulation), scene, _EntityAdapter(scene["robot"], num_envs, device)
 
 
 # 站立高度标定
@@ -128,6 +227,7 @@ def measure_stand_height(sim, scene, robot, spec, z_init: float, steps: int = 12
             fn(torch.zeros(N, 6, device=dev), env_ids=None)
             break
     robot.write_joint_state_to_sim(q, qd, None, None)
+    sim.forward()
     scene.update(0.0)
 
     leg_t = torch.tensor(spec.act_leg_idx, dtype=torch.long, device=dev)
@@ -135,17 +235,17 @@ def measure_stand_height(sim, scene, robot, spec, z_init: float, steps: int = 12
     spring_t = torch.tensor(spec.spring_idx, dtype=torch.long, device=dev)
     zs, cos_t = [], []
     for i in range(steps):
-        robot.set_joint_position_target(torch.zeros(N, len(leg_t), device=dev), joint_ids=spec.act_leg_idx)
-        robot.set_joint_velocity_target(torch.zeros(N, len(wheel_t), device=dev), joint_ids=spec.act_wheel_idx)
-        robot.set_joint_position_target(_t(robot.data.joint_pos)[:, wheel_t], joint_ids=spec.act_wheel_idx)
+        robot.set_joint_position_target(torch.zeros(N, len(leg_t), device=dev), joint_ids=leg_t)
+        robot.set_joint_velocity_target(torch.zeros(N, len(wheel_t), device=dev), joint_ids=wheel_t)
+        robot.set_joint_position_target(_t(robot.data.joint_pos)[:, wheel_t], joint_ids=wheel_t)
         if len(spec.spring_idx) > 0:
             sp = _t(robot.data.joint_pos)[:, spring_t]
             b = torch.full((N, 1), float(spring_bias), device=dev)
-            robot.set_joint_effort_target(spring_force(sp, b), joint_ids=spec.spring_idx)
-        scene.write_data_to_sim()
+            robot.set_joint_effort_target(spring_force(sp, b), joint_ids=spring_t)
         for _ in range(DECIMATION):
+            scene.write_data_to_sim()
             sim.step(render=False)
-        scene.update(CONTROL_DT)
+            scene.update(SIM_DT)
         if i >= steps - tail:
             d = robot.data
             pose = _t(d.root_link_pose_w) if hasattr(d, "root_link_pose_w") else _t(d.root_pose_w)
@@ -196,7 +296,7 @@ class TrackingSim:
         self.sim, self.scene, self.robot = sim, scene, robot
         self.spec, self.cmd, self.mdp, self.gamma = spec, cmd, mdp, gamma
         self.device = cmd.cmd.device
-        self.N = int(scene.cfg.num_envs)
+        self.N = int(scene.num_envs)
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
@@ -204,17 +304,17 @@ class TrackingSim:
 
         if list(robot.joint_names) != list(spec.joint_names):
             raise RuntimeError(
-                "关节顺序与 spec 不一致（说明 USD 与建 spec 时用的不是同一个）：\n"
+                "关节顺序与 spec 不一致（MJLab 场景关节顺序发生变化）：\n"
                 f"sim : {list(robot.joint_names)}\nspec: {list(spec.joint_names)}"
             )
 
         self.default_q = _t(robot.data.default_joint_pos)[0].clone()
-        self.leg_ids = list(spec.act_leg_idx)
-        self.wheel_ids = list(spec.act_wheel_idx)
-        self.spring_ids = list(spec.spring_idx)
-        self.leg_t = torch.tensor(self.leg_ids, dtype=torch.long, device=dev)
-        self.wheel_t = torch.tensor(self.wheel_ids, dtype=torch.long, device=dev)
-        self.spring_t = torch.tensor(self.spring_ids, dtype=torch.long, device=dev)
+        self.leg_ids = torch.tensor(spec.act_leg_idx, dtype=torch.long, device=dev)
+        self.wheel_ids = torch.tensor(spec.act_wheel_idx, dtype=torch.long, device=dev)
+        self.spring_ids = torch.tensor(spec.spring_idx, dtype=torch.long, device=dev)
+        self.leg_t = self.leg_ids
+        self.wheel_t = self.wheel_ids
+        self.spring_t = self.spring_ids
         self.default_leg = self.default_q[self.leg_t]
         self.nl = len(self.leg_ids)
         self.spring_bias_range = float(SPRING_BIAS_RANGE if spring_bias is None else spring_bias)
@@ -273,8 +373,10 @@ class TrackingSim:
         if max(rng) <= 0.0:
             return
         dev = self.device
-        base_id = self.robot.find_bodies("base_link")[0][0]
-        self._base_id = base_id
+        body_ids, _ = self.robot.find_bodies("base_link")
+        if len(body_ids) != 1:
+            raise RuntimeError("MJLab entity must contain exactly one base_link")
+        body_id = int(self.robot.indexing.body_ids[body_ids[0]])
         gain = torch.stack(
             (
                 torch.empty(self.N, device=dev).uniform_(-rng[0], rng[0]),
@@ -283,24 +385,16 @@ class TrackingSim:
             ),
             -1,
         )
-        com0 = _t(self.robot.data.body_com_pose_b)[:, base_id, :3].clone()
-        for name, kw in (("set_coms_index", "kw"), ("set_coms", "kw"), ("set_coms_index", "pos"), ("set_coms", "pos")):
-            fn = getattr(self.robot, name, None)
-            if fn is None:
-                continue
-            try:
-                if kw == "kw":
-                    fn(coms=(com0 + gain).unsqueeze(1), body_ids=[base_id])
-                else:
-                    fn((com0 + gain).unsqueeze(1), [base_id])
-                self._com_ok = True
-                break
-            except Exception:  # noqa: BLE001
-                continue
-        if self._com_ok:
-            self.xi[:, 2:5] = gain
-        else:
-            print("[env] 该 Isaac Lab 版本没有 set_coms_index/set_coms，CoM 随机化关闭（ξ 的 com 分量置 0）")
+        self.sim.expand_model_fields(("body_ipos",))
+        inertial_pos = _t(self.sim.model.body_ipos)
+        inertial_pos[:, body_id] = inertial_pos[:, body_id].clone() + gain
+        from mjlab.managers.event_manager import RecomputeLevel
+
+        self.sim.recompute_constants(RecomputeLevel.set_const)
+        self.sim.create_graph()
+        self._base_id = body_ids[0]
+        self._com_ok = True
+        self.xi[:, 2:5] = gain
 
     # 状态
     def _root_pose(self, d):
@@ -395,6 +489,7 @@ class TrackingSim:
         self.robot.set_joint_velocity_target(qd[:, self.wheel_t], joint_ids=self.wheel_ids, env_ids=env_ids)
         if len(self.spring_ids) > 0:
             self.robot.set_joint_effort_target(qd[:, self.spring_t], joint_ids=self.spring_ids, env_ids=env_ids)
+        self.sim.forward()
         self.scene.update(0.0)
 
         self.f[env_ids] = frames
@@ -446,10 +541,10 @@ class TrackingSim:
             self.robot.set_joint_effort_target(spring_force(sp, self.xi[:, 1:2]), joint_ids=self.spring_ids)
 
     def physics(self):
-        self.scene.write_data_to_sim()
         for _ in range(DECIMATION):
+            self.scene.write_data_to_sim()
             self.sim.step(render=self.render_physics)
-        self.scene.update(CONTROL_DT)
+            self.scene.update(SIM_DT)
 
     # 一步
     def step(self, a: torch.Tensor) -> dict:

@@ -10,7 +10,7 @@ NAME=${1:-wb_main}
 shift || true
 SESSION="wb_${NAME}"
 
-CMD="python supermimic_wheelbipe/train.py --headless --log_dir logs/${NAME} $*"
+CMD=".venv/bin/python supermimic_wheelbipe/train.py --headless --log_dir logs/${NAME} $*"
 if [ -n "${CPUS:-}" ]; then
   CMD="taskset -c ${CPUS} ${CMD}"
 fi
@@ -21,7 +21,7 @@ if command -v tmux >/dev/null 2>&1; then
   tmux new -d -s "${SESSION}" "cd $(pwd) && ${CMD} 2>&1 | tee logs/${NAME}/stdout.log"
   echo "started tmux session '${SESSION}'"
   echo "  attach : tmux attach -t ${SESSION}"
-  echo "  eval   : python supermimic_wheelbipe/evaluate.py --run_dir logs/${NAME} --watch --headless"
+  echo "  eval   : .venv/bin/python supermimic_wheelbipe/evaluate.py --run_dir logs/${NAME} --watch --headless"
 else
   eval "${CMD}"
 fi

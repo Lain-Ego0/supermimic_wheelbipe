@@ -9,7 +9,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-if "--list" in sys.argv:  # 不需要 Isaac，先处理掉
+if "--list" in sys.argv:  # 只列清单时先直接处理，不创建仿真场景
     from supermimic_wheelbipe.teacher import find_pretrained
 
     runs = find_pretrained()
@@ -20,7 +20,6 @@ if "--list" in sys.argv:  # 不需要 Isaac，先处理掉
         print(f"  [{jit}] {os.path.relpath(r, base)}")
     sys.exit(0)
 
-from isaaclab.app import AppLauncher  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["play", "record", "bc"], default="play")
@@ -62,11 +61,9 @@ parser.add_argument("--bc_keep", type=int, default=32, help="缓冲保留的步�
 parser.add_argument("--bc_grad_steps", type=int, default=8)
 parser.add_argument("--bc_batch", type=int, default=2048)
 parser.add_argument("--lr", type=float, default=1e-3)
-AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--device", default="cuda:0")
+parser.add_argument("--headless", action="store_true", help="兼容旧命令行参数，MJLab Warp 使用无窗口训练")
 args = parser.parse_args()
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
 import torch  # noqa: E402
 
@@ -76,7 +73,8 @@ from supermimic_wheelbipe.constants import default_height_cmd, default_term_heig
 from supermimic_wheelbipe.env import TrackingSim, make_sim_cfg, make_world, resolve_stand_height  # noqa: E402
 from supermimic_wheelbipe.kinematics import Kinematics  # noqa: E402
 from supermimic_wheelbipe.mdp import MAX_STEP_REWARD, MDP, RewardCfg  # noqa: E402
-from supermimic_wheelbipe.model import ensure_model, wheel_bodies  # noqa: E402
+from supermimic_wheelbipe.kinematics import model_from_mjcf
+from supermimic_wheelbipe.model import wheel_bodies  # noqa: E402
 from supermimic_wheelbipe.networks import Policy  # noqa: E402
 from supermimic_wheelbipe.robot import CONTROL_DT, build_spec, make_robot_cfg, usd_path  # noqa: E402
 from supermimic_wheelbipe.teacher import Teacher, pick_best_teacher  # noqa: E402
@@ -101,7 +99,7 @@ def build_all(dev, num_envs, eval_mode: bool, fixed_cmd=None, grid: bool = False
     kin = None
     if not args.no_kin:
         try:
-            model = ensure_model(usd, path=args.model_json)
+            model = model_from_mjcf(sim.mj_model)
             kin = Kinematics(model, list(robot.joint_names), dev, tracked=list(robot.body_names),
                              wheel_bodies=wheel_bodies(model, spec))
         except Exception as e:  # noqa: BLE001
@@ -183,7 +181,7 @@ def play(sim, env, cmd, tea, grid: bool = False):
         print(f"[play] 第 {done_at} 步终止：老师在我们的环境里没能撑住。"
               "先跑 tools/calibrate.py，重点看弹簧力、z_stand、term_height。")
     else:
-        print("[play] 全程没有触发终止 —— 说明 USD / 关节分组 / 弹簧力 / 动作语义都对齐了")
+        print("[play] 全程没有触发终止 —— 说明 MJCF / 关节分组 / 弹簧力 / 动作语义都对齐了")
 
 
 @torch.no_grad()
@@ -222,7 +220,7 @@ def play_grid(env, cmd, tea, steps):
     m_lin = float((e_lin / cnt).mean())
     print(f"\n[grid] 存活 ≥90% 的指令: {ok}/{N}；平均 |e_lin| {m_lin:.3f} m/s")
     if ok >= N - 1 and m_lin < 0.25:
-        print("[grid] PASS —— 老师在这套环境里跑得对，说明 USD/关节分组/弹簧力/动作语义和原项目一致。"
+        print("[grid] PASS —— 老师在这套环境里跑得对，说明 MJCF/关节分组/弹簧力/动作语义和原项目一致。"
               "可以继续 record / bc。")
     elif ok >= N * 0.6:
         print("[grid] PARTIAL —— 大部分指令能跑，个别工况（看上面 存活 短的行）有偏差。"
@@ -230,7 +228,7 @@ def play_grid(env, cmd, tea, steps):
     else:
         print("[grid] FAIL —— 老师大面积摔。不要往下做 record/bc，先按这个顺序查："
               "① tools/calibrate.py 的 FK 误差与静置过程；② spring force @ q=0 是否为 ~570 N；"
-              "③ --friction 是否 1.0；④ USD 是否用了 _ng 版（--no_gimbal_usd 0 试试）。")
+              "③ --friction 是否 1.0；④ 是否需要无云台 MJCF（--no_gimbal_usd 0 试试）。")
 
 
 # record
@@ -331,20 +329,4 @@ def bc(env, cmd, tea, mdp, spec, dev):
 
 
 if __name__ == "__main__":
-    import threading
-
-    from supermimic_wheelbipe import exit_fast
-
-    code = 0
-    try:
-        main()
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        code = 1
-    # Kit 的 close() 在跑过物理之后经常卡好几分钟；给 20 s 让它刷缓存，然后硬退出
-    th = threading.Thread(target=simulation_app.close, daemon=True)
-    th.start()
-    th.join(20.0)
-    exit_fast(code)
+    main()

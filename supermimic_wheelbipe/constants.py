@@ -6,8 +6,8 @@ from __future__ import annotations
 import torch
 
 # 时间
-DECIMATION = 4
-SIM_DT = 1.0 / 200.0
+SIM_DT = 0.0005
+DECIMATION = 40
 CONTROL_DT = SIM_DT * DECIMATION  # 50 Hz
 
 # 轮半径

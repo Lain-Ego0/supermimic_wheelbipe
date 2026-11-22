@@ -29,4 +29,11 @@ CoRL 2026, https://arxiv.org/abs/2610.28480。
 
 ## 4. 外部依赖
 
-Isaac Sim 与 Isaac Lab（BSD-3-Clause）为外部依赖，不随本仓库分发。
+历史 Isaac Lab 实现（BSD-3-Clause）不随本仓库分发。当前 MJLab 后端及其许可信息见下节。
+
+## 5. MJLab 与运行时依赖
+
+- MJLab 项目：https://github.com/mujocolab/mjlab
+- 许可：BSD-3-Clause。
+- 使用范围：项目环境锁定 MJLab 1.6.0 及其 MuJoCo Warp 仿真依赖。
+- MJLab 通过 `uv.lock` 安装，不随本仓库复制其源代码。

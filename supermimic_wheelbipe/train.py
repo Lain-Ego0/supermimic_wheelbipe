@@ -13,7 +13,6 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from isaaclab.app import AppLauncher  # noqa: E402
 
 parser = argparse.ArgumentParser(description="SuperMimic-style training for wheelbipe")
 parser.add_argument("--num_envs", type=int, default=4096)
@@ -71,11 +70,9 @@ parser.add_argument("--teacher_mix", type=float, default=0.5, help="采集时用
 parser.add_argument("--teacher_mix_iters", type=int, default=3000, help="只在前 N 轮混老师数据")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"])
 parser.add_argument("--compile", type=int, default=1)
-AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--device", default="cuda:0")
+parser.add_argument("--headless", action="store_true", help="兼容旧命令行参数，MJLab Warp 使用无窗口训练")
 args = parser.parse_args()
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
@@ -87,7 +84,8 @@ from supermimic_wheelbipe.constants import default_term_height, height_window  #
 from supermimic_wheelbipe.env import TrackingSim, make_sim_cfg, make_world, resolve_stand_height  # noqa: E402
 from supermimic_wheelbipe.kinematics import Kinematics  # noqa: E402
 from supermimic_wheelbipe.mdp import MAX_STEP_REWARD, MDP, RewardCfg, normalize_xi  # noqa: E402
-from supermimic_wheelbipe.model import ensure_model, wheel_bodies  # noqa: E402
+from supermimic_wheelbipe.kinematics import model_from_mjcf
+from supermimic_wheelbipe.model import wheel_bodies  # noqa: E402
 from supermimic_wheelbipe.networks import Critic, Policy, WorldModel  # noqa: E402
 from supermimic_wheelbipe.robot import (  # noqa: E402
     ACTION_CLIP,
@@ -112,7 +110,7 @@ def main():
 
     # sim + robot
     usd = usd_path(no_gimbal=bool(args.no_gimbal_usd))
-    print(f"[train] USD = {usd}")
+    print(f"[train] MJCF = {usd}")
     sim_cfg = make_sim_cfg(dev, friction=args.friction)
     sim, scene, robot = make_world(sim_cfg, args.num_envs, make_robot_cfg(usd), env_spacing=args.env_spacing)
     print("[train] robot joints:", list(robot.joint_names))
@@ -128,7 +126,7 @@ def main():
     kin = None
     if not args.no_kin:
         try:
-            model = ensure_model(usd, path=args.model_json)
+            model = model_from_mjcf(sim.mj_model)
             wheel_names = wheel_bodies(model, spec)
             kin = Kinematics(
                 model, list(robot.joint_names), dev, tracked=list(robot.body_names), wheel_bodies=wheel_names
@@ -166,9 +164,11 @@ def main():
         height=h_range, lin_vel_x=tuple(args.lin_vel_x), ang_vel_z=tuple(args.ang_vel_z),
         focus=focus, focus_prob=float(args.focus_prob),
     )  # fmt: skip
-    qd_lim = robot.data.joint_vel_limits
-    qd_lim = qd_lim.torch if hasattr(qd_lim, "torch") else qd_lim
-    mdp = MDP(spec, cmd, kin=kin, default_q=default_q, qd_limit=qd_lim[0] * 2.0,
+    qd_lim = torch.full_like(default_q, 300.0)
+    qd_lim[torch.tensor(spec.wheel_idx, device=dev)] = 30.0
+    qd_lim[torch.tensor(spec.act_leg_idx, device=dev)] = 17.0
+    qd_lim[torch.tensor(spec.gimbal_idx, device=dev)] = 30.0
+    mdp = MDP(spec, cmd, kin=kin, default_q=default_q, qd_limit=qd_lim * 2.0,
               cfg=RewardCfg(term_height=term_height))
     env = TrackingSim(
         sim, scene, robot, spec, cmd, mdp,
@@ -506,20 +506,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import threading
-
-    from supermimic_wheelbipe import exit_fast
-
-    code = 0
-    try:
-        main()
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        code = 1
-    # Kit 的 close() 在跑过物理之后经常卡好几分钟；给 20 s 让它刷缓存，然后硬退出
-    th = threading.Thread(target=simulation_app.close, daemon=True)
-    th.start()
-    th.join(20.0)
-    exit_fast(code)
+    main()

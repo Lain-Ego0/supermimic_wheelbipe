@@ -2,47 +2,28 @@
 
 ## 环境
 
-Linux x86_64，RTX 显卡（训练）。Isaac Sim 5.1 + Isaac Lab 2.3.2，与 `wheeled-legged_RL` 同一套环境。
-`python` 能用 `import isaaclab` 即可，不需要 Docker，也不需要 Newton / MuJoCo。
-
-资产路径：
+项目使用 Python 3.12、MJLab 1.6.0、MuJoCo/MuJoCo Warp 3.11 和 CUDA PyTorch。依赖及兼容的 `mjviser` 版本由 `uv.lock` 固定。
 
 ```bash
-export WHEELBIPE_ASSET_ROOT=/path/to/wheeled-legged_RL/source/agent_world/agent_world/assets/usd_files
+uv python install 3.12
+uv sync --locked
+uv run python -c "import mujoco, mjlab, torch; print(mujoco.__version__, torch.cuda.is_available())"
 ```
+
+`uv sync --locked` 在项目根目录创建 `.venv`。训练与评估通过 MJLab `Scene`、`Entity` 和 Warp `Simulation` 运行，物理步长为 0.0005 秒，策略控制周期为 0.02 秒。MJCF 中额外的闭链导向关节仍参与仿真，接口按已有检查点的关节名称和顺序组装观察量。
 
 ## 标定
 
 ```bash
-python tools/calibrate.py --headless
+uv run python tools/calibrate.py --device cuda:0
 ```
 
-依次看 6 段输出：
-
-1. `joint_names` 顺序，无云台的版本应该是 18 - 20 个关节，`na=6`。
-2. `FK 校验` 误差应 <= 1e-2 m。超过 2 cm 说明运动学树抽错了，`no_fork` 会算错，可以先加 `--no_kin`。
-3. `FK 估计站立高度`，后面所有高度指令都相对它。
-4. `零动作静置`：机身持续下沉、轮子不动，说明弹簧力方向或大小不对，先别训练。
-5. 用稳态高度定 `--height_range` 和 `--term_height`。
+标定会打印 MJLab 关节清单、动作分组、弹簧模型、MJCF 前向运动学误差和站立高度。模型刚体位置的 FK 校验误差应低于 0.01 米。可用 `--settle_steps` 调整零动作静置步数，已知站立高度时可以用 `--stretch` 覆盖。
 
 ## 训练
 
 ```bash
-# 带行为克隆热启动（推荐）
-python supermimic_wheelbipe/train.py --num_envs 4096 --headless \
-  --log_dir logs/wb_main --lin_vel_x -2.7 2.7 --ang_vel_z -6.2832 6.2832
-
-# 从零开始，前 1000 轮的想象数据基本是随机乱蹬
-python supermimic_wheelbipe/train.py --num_envs 4096 --headless --log_dir logs/wb_scratch
-
-# 或
-./run_train.sh wb_main
-```
-
-最终配置（本仓库那次是续训约 4300 轮 / 43 分钟）：
-
-```bash
-python supermimic_wheelbipe/train.py --headless \
+uv run python supermimic_wheelbipe/train.py --device cuda:0 --headless \
   --num_envs 4096 --iterations 24000 --wm_only_iters 800 --warmup_steps 1500 \
   --log_every 10 --horizon 16 --compile 0 --utd 2.0 \
   --wm_batches 5 --wm_batch 8192 --pi_batch 4096 \
@@ -50,89 +31,44 @@ python supermimic_wheelbipe/train.py --headless \
   --log_dir logs/wb_final
 ```
 
-启动时有两件事会打印出来：
+使用 `--resume logs/wb_final/last.pt` 从完整训练检查点续训。单独的推理策略检查点可用于评估和回放，但不包含世界模型及优化器状态。`run_train.sh` 会调用项目 `.venv` 中的 Python。
 
-- 零动作静置 `--settle_steps` 步（默认 120 步 = 2.4 s）取稳态根高度，作为重置高度和高度指令的基准。
-  `[settle]` 行倾角 cos < 0.9 表示零动作下机器人会倒，先检查弹簧和执行器。已知数值可用 `--z_stand` 直接给。
-- 高度指令窗口默认 `[z-0.08, z-0.02]`，用 `--height_range` 覆盖。策略稳了以后再往下扩，一次 0.02 m。
+零动作静置默认执行 120 个策略步，也就是 2.4 秒。`--z_stand` 可以指定已知站立高度，`--settle_steps 0` 可跳过静置。高度指令默认取站立高度附近的窗口，可由 `--height_range` 和 `--term_height` 指定。
 
-`evaluate.py` 和 `tools/play.py` 也会做同样的 settle，保证评测高度落在训练分布内。
+训练日志保存在 `logs/<run>/train_log.csv`。`wm_loss` 和 `wm_err8` 表示世界模型误差，`imag_survival` 表示想象 rollout 存活率，`sim_rew` 表示仿真单步奖励，`ep_len`、`ep_ret_norm` 和 `term_frac` 表示真实仿真回合表现。
 
-前 `--wm_only_iters` 轮只训世界模型。`logs/<run>/train_log.csv` 每 50 轮一行：
-
-| 列 | 含义 | 期望 |
-|---|---|---|
-| `wm_loss` / `wm_err8` | 世界模型误差 | 前 1000 轮快速下降后稳定 |
-| `imag_survival` | 想象 rollout 存活率 | 长期 < 0.3 说明策略没学会或世界模型太差 |
-| `sim_rew` | 仿真归一化步奖励 | 1.0 是理论上限 |
-| `ep_len` / `ep_ret_norm` / `term_frac` | 仿真里的真实表现 | `term_frac` 高说明重置就摔或奖励不一致 |
-
-## 评测
+## 评估
 
 ```bash
-python supermimic_wheelbipe/evaluate.py --ckpt logs/wb_main/ckpt_004000.pt --headless
-python supermimic_wheelbipe/evaluate.py --run_dir logs/wb_main --watch --headless
+uv run python supermimic_wheelbipe/evaluate.py \
+  --device cuda:0 --ckpt logs/wb_final/ckpt_024000.pt
 ```
 
-16 条指令：7 档直行，6 档原地转，直行带转向，后退带转向，站立。
-报告 `norm_return`、失败数、`mean|e_lin| / mean|e_ang| / mean|e_h|`。
+默认评估 16 条固定速度和偏航指令。使用 `--run_dir logs/wb_final --watch` 持续评估新检查点。旧 Isaac Lab 检查点保留原关节名和观察顺序，MJLab 实体按名称映射关节状态及执行器目标。
 
-## 录制
-
-一次 Isaac 启动，按指令逐段录，numpy 拼 2x2 存 mp4，不需要 ffmpeg 拼接。
+## 交互回放
 
 ```bash
-# 默认 4 条速度 0.5 / 1.0 / 1.5 / -0.5
-python tools/play.py --ckpt logs/wb_main/ckpt_004000.pt --enable_cameras
-
-# 老师当参考
-python tools/play.py --teacher auto --enable_cameras --video videos/teacher.mp4
-
-# 四格放前进 + 转向，--commands 与 --wzs 一一对应
-python tools/play.py --teacher auto --commands 0.8,0.8,-0.8,-0.8 --wzs 0,1.5,0,-1.5
-
-# 变腿，四格相位自动错开 0.5 s
-python tools/play.py --ckpt logs/wb_final/last.pt --commands 0,0,0,0 \
-  --leg_lo 0.20 --leg_hi 0.28 --leg_period 2.0 --enable_cameras --video videos/leg.mp4
-
-# 只看窗口不录
-python tools/play.py --teacher auto --video none --cmd 1.0 0 -1
+uv run python tools/play.py --ckpt logs/wb_final/ckpt_024000.pt --gamepad off
 ```
 
-录制走 Replicator 的 render product（自建 `/World/rec_cam`），不依赖视口，ssh 也能录。
-`--resolution 640 360` 拼出来是 1280x720，能被 16 整除。摔了的那格会冻结最后一帧补齐时间轴。
-`--stills` 存每格最后一张 png。结束时打印 `scp` 命令，照抄即可。mp4 存不下来会退化成 png 序列。
+回放打开 MuJoCo 窗口和独立的「Wheelbipe 驾驶面板」。W/S 或方向键调节前向速度，A/D 或方向键调节偏航，Q/E 调节目标高度。空格将速度目标归零，R 复位，Esc 退出。键盘驾驶只在面板获得焦点时生效，MuJoCo 窗口继续接收相机快捷键。该入口使用与 MJLab 训练相同的 MJCF 和策略检查点。
+
+不打开窗口时可以执行有限步数的回放：
+
+```bash
+uv run python tools/play.py --ckpt logs/wb_final/ckpt_024000.pt \
+  --headless --steps 400 --cmd 0.8 0.0 0.24 --gamepad off
+```
 
 ## 工具
 
-| 脚本 | 作用 | 需要 RTX |
-|---|---|---|
-| `tools/selftest_cpu.py` | 形状和逻辑自检 | 否 |
-| `tools/extract_model.py` | 单独提取运动学树 | 否 |
-| `tools/calibrate.py` | FK 校验、站立高度、弹簧力 | 是 |
-| `tools/run_teacher.py` | 老师自检、录参考轨迹、行为克隆 | 是 |
-| `tools/play.py` | 回放和录四格视频 | 是 |
-| `supermimic_wheelbipe/evaluate.py` | 16 条指令评测 | 是 |
-| `supermimic_wheelbipe/train.py` | 训练主循环 | 是 |
-
-## MuJoCo 跨仿真部署
-
-MuJoCo 回放和评测可在 CPU 环境运行。仓库的 `data/mujoco-venv` 是本机虚拟环境，`data/local_env.sh` 是另一个 Isaac Sim 训练环境的入口。
-
-在项目根目录执行。桌面回放需要 Python 包含 Tk（可用 `python -m tkinter` 检查）。这些命令需要已下载上游机器人 USD 和已有训练检查点。
-
-```bash
-uv venv --python 3.11 data/mujoco-venv
-uv pip install --python data/mujoco-venv/bin/python --index https://download.pytorch.org/whl/cpu torch==2.7.1
-uv pip install --python data/mujoco-venv/bin/python mujoco==3.7.0 usd-core==26.11 numpy==2.4.6
-
-# 已生成 XML 且 USD 没有改动时可跳过导出。
-data/mujoco-venv/bin/python tools/usd2mjcf.py --fk-json
-data/mujoco-venv/bin/python tools/mujoco_check.py --ckpt logs/wb_final/ckpt_024000.pt
-data/mujoco-venv/bin/python tools/evaluate_mujoco.py --ckpt logs/wb_final/ckpt_024000.pt \
-  --height-cmd 0.145 --term-height 0.119 --out logs/review/mujoco-eval-024000.json
-data/mujoco-venv/bin/python tools/play_mujoco.py --ckpt logs/wb_final/ckpt_024000.pt \
-  --cmd 0 0 0.145 --gamepad off
-```
-
-点击「Wheelbipe 驾驶面板」后使用驾驶键。按住 W/S 或 ↑/↓ 改变前向目标，A/D 或 ←/→ 改变偏航目标，Q/E 改变高度。松开按键会保持目标。空格把速度和转速目标归零，R 复位，Esc 退出。切到 MuJoCo 窗口操作相机时，键盘驾驶目标自动归零。
+| 脚本 | 用途 |
+|---|---|
+| `tools/selftest_cpu.py` | 网络、缓冲区、命令库和奖励逻辑自检 |
+| `tools/calibrate.py` | MJLab 实体、MJCF 运动学和站立状态标定 |
+| `tools/run_teacher.py` | 教师策略采样、回放和行为克隆 |
+| `supermimic_wheelbipe/train.py` | SuperMimic 训练主循环 |
+| `supermimic_wheelbipe/evaluate.py` | MJLab GPU 固定指令评估 |
+| `tools/play.py` | MuJoCo GUI 策略回放和驾驶面板 |
+| `tools/evaluate_mujoco.py` | CPU MuJoCo 跨仿真评估 |

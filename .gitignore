@@ -1,4 +1,5 @@
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -40,3 +41,6 @@ assets/mujoco/meshes/
 
 # 生成产物：usd2mjcf.py 导出的 MJCF 和 mesh
 assets/
+
+# MuJoCo runtime log
+MUJOCO_LOG.TXT

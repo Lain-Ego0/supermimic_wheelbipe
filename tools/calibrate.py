@@ -8,18 +8,15 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from isaaclab.app import AppLauncher  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_json", type=str, default=os.path.join(REPO, "data", "wheelbipe_v14_2_model.json"))
 parser.add_argument("--stretch", type=float, default=None, help="覆盖 z_stand")
 parser.add_argument("--settle_steps", type=int, default=300)
 parser.add_argument("--no_gimbal_usd", type=int, default=0)
-AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--device", default="cuda:0")
+parser.add_argument("--headless", action="store_true", help="兼容旧命令行参数，MJLab Warp 使用无窗口训练")
 args = parser.parse_args()
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
 import torch  # noqa: E402
 
@@ -27,7 +24,8 @@ from supermimic_wheelbipe.command import CommandLib  # noqa: E402
 from supermimic_wheelbipe.env import TrackingSim, make_sim_cfg, make_world  # noqa: E402
 from supermimic_wheelbipe.kinematics import Kinematics  # noqa: E402
 from supermimic_wheelbipe.mdp import MDP, normalize_xi  # noqa: E402
-from supermimic_wheelbipe.model import ensure_model, wheel_bodies  # noqa: E402
+from supermimic_wheelbipe.kinematics import model_from_mjcf
+from supermimic_wheelbipe.model import wheel_bodies  # noqa: E402
 from supermimic_wheelbipe.robot import (  # noqa: E402
     SPRING_FORCE_DOWN,
     SPRING_FORCE_UP,
@@ -48,7 +46,7 @@ def _t(v):
 def main():
     dev = args.device
     usd = usd_path(no_gimbal=bool(args.no_gimbal_usd))
-    print(f"[calib] USD = {usd}")
+    print(f"[calib] MJCF = {usd}")
     sim, scene, robot = make_world(make_sim_cfg(dev), 1, make_robot_cfg(usd))
 
     print("\n=== 1. articulation 清单 ===")
@@ -72,10 +70,10 @@ def main():
         print("!! 没有找到 spring2 关节：腿会塌，检查关节命名")
 
     # FK 校验
-    print("\n=== 4. FK 校验（USD 树 vs 仿真）===")
+    print("\n=== 4. FK 校验（MJCF 树 vs MJLab 仿真）===")
     kin = None
     try:
-        model = ensure_model(usd, path=args.model_json)
+        model = model_from_mjcf(sim.mj_model)
         wb = wheel_bodies(model, spec)
         kin = Kinematics(model, list(robot.joint_names), dev, tracked=list(robot.body_names), wheel_bodies=wb)
         print(f"运动学树: {kin.num_bodies} 刚体 / {kin.num_movable} 可动; 轮子刚体={wb}")
@@ -88,6 +86,7 @@ def main():
         quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=dev)
         robot.write_root_pose_to_sim(torch.cat((root_p, quat), -1), env_ids=torch.tensor([0], device=dev))
         robot.write_joint_state_to_sim(q, qd, None, torch.tensor([0], device=dev))
+        sim.forward()
         scene.update(0.0)
         sp = _t(robot.data.body_link_pose_w)[0, :, :3] - org
         R = torch.eye(3, device=dev).unsqueeze(0)
@@ -146,20 +145,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import threading
-
-    from supermimic_wheelbipe import exit_fast
-
-    code = 0
-    try:
-        main()
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        code = 1
-    # Kit 的 close() 在跑过物理之后经常卡好几分钟；给 20 s 让它刷缓存，然后硬退出
-    th = threading.Thread(target=simulation_app.close, daemon=True)
-    th.start()
-    th.join(20.0)
-    exit_fast(code)
+    main()

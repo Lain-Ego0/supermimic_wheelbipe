@@ -40,34 +40,33 @@
 
 ## 安装
 
-Linux + RTX（训练），Isaac Sim 5.1 + Isaac Lab 2.3.2，和 `wheeled-legged_RL` 用同一套环境。
-
-机器人只有 USD 资产，没有 URDF，需要自己指定路径：
+Linux x86_64，Python 3.12，训练后端为 MJLab 1.6.0、MuJoCo Warp 和 CUDA PyTorch。依赖由 `uv.lock` 固定：
 
 ```bash
-export WHEELBIPE_ASSET_ROOT=/path/to/wheeled-legged_RL/source/agent_world/agent_world/assets/usd_files
+uv python install 3.12
+uv sync --locked
 ```
+
 
 老师权重、`logs/`、生成出来的 mesh 都不在仓库里。老师怎么用见 [docs/upstream.md](docs/upstream.md)。
 
 ## 跑
 
 ```bash
-python tools/selftest_cpu.py            # 30 秒，改奖励或维度后先过这一关
-python tools/calibrate.py --headless    # FK 误差应 <= 1e-2 m，弹簧力 ~570 N
+uv run python tools/selftest_cpu.py            # 30 秒，改奖励或维度后先过这一关
+uv run python tools/calibrate.py --device cuda:0    # FK 误差应 <= 1e-2 m，弹簧力 ~570 N
 
-python supermimic_wheelbipe/train.py --headless \
+uv run python supermimic_wheelbipe/train.py --headless \
   --num_envs 4096 --iterations 24000 --wm_only_iters 800 --warmup_steps 1500 \
   --horizon 16 --compile 0 --utd 2.0 --wm_batches 5 --wm_batch 8192 --pi_batch 4096 \
   --lin_vel_x -1.5 1.5 --ang_vel_z -10.21 10.21 --height_range 0.20 0.28 --log_dir logs/wb_final
 
-python supermimic_wheelbipe/evaluate.py --run_dir logs/wb_final --headless
+uv run python supermimic_wheelbipe/evaluate.py --device cuda:0 --run_dir logs/wb_final --headless
 
-python tools/play.py --ckpt logs/wb_final/last.pt --commands 1.4,0.0,0.8,0.0 \
-  --wzs 0,10.21,6.28,-10.21 --height_cmd 0.24 --enable_cameras --video videos/show.mp4
+uv run python tools/play.py --ckpt logs/wb_final/last.pt --gamepad off
 ```
 
-上面这组训练参数在 4090 上跑到 5570 env-step/s，显存 17.8 GB。若从已有检查点续训，加 `--resume`，本仓库那次约 4300 轮 / 43 分钟。
+上表训练速度和已发布控制效果来自迁移前的 Isaac Lab 训练记录，不代表 MJLab 的性能基准。MJLab 下可从兼容的完整检查点使用 `--resume` 续训。
 
 启动时会先静置 120 步测站立高度，`[settle]` 行里倾角 cos < 0.9 说明零动作下机器人会倒，别急着训练。
 日志看 `wm_err8`、`imag_survival`、`sim_rew`、`term_frac` 四项。其余参数和录制选项在 [docs/install.md](docs/install.md)。
@@ -83,7 +82,7 @@ curl -fL --retry 3 -o logs/wb_final/pi.pt \
 
 sha256sum logs/wb_final/pi.pt    # a08deac15a4b68916c32049b95416da1d44ea9d146ea61f7a398b8c032eab332
 
-python tools/play.py --ckpt logs/wb_final/pi.pt --enable_cameras
+uv run python tools/play.py --ckpt logs/wb_final/pi.pt --gamepad off
 ```
 
 发布的 27.7 MB 只含策略网络 `pi`，能推理、评测、录制，**不能 `--resume`**；续训要 184 MB 的完整检查点（含 `wm` / `critic` / 三个优化器），不发布，按上面的训练命令自己跑。
@@ -91,8 +90,8 @@ python tools/play.py --ckpt logs/wb_final/pi.pt --enable_cameras
 ## 已知限制
 
 - 顶速 1.4 - 1.5 m/s，低于上游 2 - 3 m/s 的目标。
-- 摩擦力不能逐 env 随机化，PhysX 的 `replicate_physics=True` 下所有 env 共用一个材质。鲁棒性靠弹簧力 ±50 N 和 CoM 抖动。
-- 没有 URDF 就没有 IK，重置姿态只能是零动作静置后的姿态，所以 episode 都从稳态高度附近起步。
+- 已有跨仿真性能数据来自 Isaac Lab。MJLab 迁移后的长期控制表现需要重新训练和评测。
+- 目前 MJLab 训练已保留逐环境 CoM 和弹簧偏置随机化。
 - 老师只在世界模型前 800 轮混采，且没有做过「完全不给老师」的对照，不能声称不用老师也能到 0.066。
 - 轮角不进状态，世界模型只预测轮速。想做轮子相位类任务要改。
 

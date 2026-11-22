@@ -13,7 +13,6 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from isaaclab.app import AppLauncher  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_dir", type=str, default=None)
@@ -30,11 +29,9 @@ parser.add_argument("--friction", type=float, default=1.0)
 parser.add_argument("--model_json", type=str, default=os.path.join(REPO, "data", "wheelbipe_v14_2_model.json"))
 parser.add_argument("--no_gimbal_usd", type=int, default=0)
 parser.add_argument("--no_kin", action="store_true")
-AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--device", default="cuda:0")
+parser.add_argument("--headless", action="store_true", help="兼容旧命令行参数，MJLab Warp 使用无窗口训练")
 args = parser.parse_args()
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
 
 import torch  # noqa: E402
 
@@ -44,7 +41,8 @@ from supermimic_wheelbipe.constants import default_height_cmd, default_term_heig
 from supermimic_wheelbipe.env import TrackingSim, make_sim_cfg, make_world, resolve_stand_height  # noqa: E402
 from supermimic_wheelbipe.kinematics import Kinematics  # noqa: E402
 from supermimic_wheelbipe.mdp import MAX_STEP_REWARD, MDP, RewardCfg  # noqa: E402
-from supermimic_wheelbipe.model import ensure_model, wheel_bodies  # noqa: E402
+from supermimic_wheelbipe.kinematics import model_from_mjcf
+from supermimic_wheelbipe.model import wheel_bodies  # noqa: E402
 from supermimic_wheelbipe.networks import Policy  # noqa: E402
 from supermimic_wheelbipe.robot import WHEEL_RADIUS, build_spec, make_robot_cfg, usd_path  # noqa: E402
 
@@ -65,7 +63,7 @@ def main():
     kin = None
     if not args.no_kin:
         try:
-            model = ensure_model(usd, path=args.model_json)
+            model = model_from_mjcf(sim.mj_model)
             kin = Kinematics(model, list(robot.joint_names), dev, tracked=list(robot.body_names),
                              wheel_bodies=wheel_bodies(model, spec))
         except Exception as e:  # noqa: BLE001
@@ -176,20 +174,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import threading
-
-    from supermimic_wheelbipe import exit_fast
-
-    code = 0
-    try:
-        main()
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        code = 1
-    # Kit 的 close() 在跑过物理之后经常卡好几分钟；给 20 s 让它刷缓存，然后硬退出
-    th = threading.Thread(target=simulation_app.close, daemon=True)
-    th.start()
-    th.join(20.0)
-    exit_fast(code)
+    main()

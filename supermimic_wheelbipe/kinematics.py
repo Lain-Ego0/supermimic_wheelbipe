@@ -168,3 +168,89 @@ def solve_stance(kin, spec, q0: torch.Tensor, target_h: float = 0.25, wheel_radi
         print(f"[stance] 反解站立姿态: 目标轮心 z={target:+.3f}, 残差 {err:.3f} m, "
               f"对应根高度 {h:.3f} m, 轮心 x=[{float(P[0,0]):+.3f},{float(P[-1,0]):+.3f}]", flush=True)
     return q_sol.detach(), h
+
+
+def model_from_mjcf(mj_model) -> dict:
+    """Create this module's FK tree representation from a compiled MuJoCo model."""
+    import mujoco
+
+    bodies = []
+    body_to_node = {}
+    joints_by_body = {}
+    for joint_id in range(mj_model.njnt):
+        body_id = int(mj_model.jnt_bodyid[joint_id])
+        joints_by_body.setdefault(body_id, []).append(joint_id)
+
+    for body_id in range(1, mj_model.nbody):
+        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id).removeprefix("robot/")
+        parent_id = int(mj_model.body_parentid[body_id])
+        parent_node = body_to_node.get(parent_id, -1)
+        body_quat = mj_model.body_quat[body_id].tolist()
+        body_pos = mj_model.body_pos[body_id].tolist()
+        attached_joints = joints_by_body.get(body_id, [])
+        if len(attached_joints) > 1:
+            raise ValueError(f"FK tree conversion expects at most one joint per body: {name}")
+
+        if not bodies:
+            node = {
+                "name": name,
+                "parent": -1,
+                "joint": None,
+                "kind": "root",
+                "axis": [0.0, 0.0, 0.0],
+                "p_J": [0.0, 0.0, 0.0],
+                "q_J": [1.0, 0.0, 0.0, 0.0],
+                "p_B": [0.0, 0.0, 0.0],
+                "q_B": [1.0, 0.0, 0.0, 0.0],
+                "lower": None,
+                "upper": None,
+            }
+        elif attached_joints:
+            joint_id = attached_joints[0]
+            joint_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id).removeprefix("robot/")
+            joint_type = mj_model.jnt_type[joint_id]
+            kind = {
+                mujoco.mjtJoint.mjJNT_HINGE: "revolute",
+                mujoco.mjtJoint.mjJNT_SLIDE: "prismatic",
+            }.get(joint_type, "fixed")
+            joint_pos = mj_model.jnt_pos[joint_id]
+            quat = body_quat
+            w, x, y, z = quat
+            bx, by, bz = body_pos
+            jx, jy, jz = joint_pos
+            rotated = [
+                bx + (1 - 2 * (y * y + z * z)) * jx + 2 * (x * y - z * w) * jy + 2 * (x * z + y * w) * jz,
+                by + 2 * (x * y + z * w) * jx + (1 - 2 * (x * x + z * z)) * jy + 2 * (y * z - x * w) * jz,
+                bz + 2 * (x * z - y * w) * jx + 2 * (y * z + x * w) * jy + (1 - 2 * (x * x + y * y)) * jz,
+            ]
+            limited = bool(mj_model.jnt_limited[joint_id])
+            node = {
+                "name": name,
+                "parent": parent_node,
+                "joint": joint_name,
+                "kind": kind,
+                "axis": mj_model.jnt_axis[joint_id].tolist(),
+                "p_J": rotated,
+                "q_J": body_quat,
+                "p_B": (-mj_model.jnt_pos[joint_id]).tolist(),
+                "q_B": [1.0, 0.0, 0.0, 0.0],
+                "lower": float(mj_model.jnt_range[joint_id, 0]) if limited else None,
+                "upper": float(mj_model.jnt_range[joint_id, 1]) if limited else None,
+            }
+        else:
+            node = {
+                "name": name,
+                "parent": parent_node,
+                "joint": None,
+                "kind": "fixed",
+                "axis": [0.0, 0.0, 0.0],
+                "p_J": body_pos,
+                "q_J": body_quat,
+                "p_B": [0.0, 0.0, 0.0],
+                "q_B": [1.0, 0.0, 0.0, 0.0],
+                "lower": None,
+                "upper": None,
+            }
+        body_to_node[body_id] = len(bodies)
+        bodies.append(node)
+    return {"root": bodies[0]["name"], "bodies": bodies}
