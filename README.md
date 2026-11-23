@@ -64,9 +64,12 @@ uv run python supermimic_wheelbipe/train.py --headless \
 uv run python supermimic_wheelbipe/evaluate.py --device cuda:0 --run_dir logs/wb_final --headless
 
 uv run python tools/play.py --ckpt logs/wb_final/last.pt --gamepad off
+uv run python tools/play_viser.py --ckpt logs/wb_final/ckpt_024000.pt --port 8080
 ```
 
 上表训练速度和已发布控制效果来自迁移前的 Isaac Lab 训练记录，不代表 MJLab 的性能基准。MJLab 下可从兼容的完整检查点使用 `--resume` 续训。
+
+`tools/play_viser.py` 会在浏览器中回放策略，可调前向速度、偏航角速度和目标高度，也可复位机器人。默认访问 `http://127.0.0.1:8080`。
 
 启动时会先静置 120 步测站立高度，`[settle]` 行里倾角 cos < 0.9 说明零动作下机器人会倒，别急着训练。
 日志看 `wm_err8`、`imag_survival`、`sim_rew`、`term_frac` 四项。其余参数和录制选项在 [docs/install.md](docs/install.md)。
