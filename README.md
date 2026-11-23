@@ -1,5 +1,7 @@
 # SuperMimic 轮腿版
 
+> **原项目**：[RadiantForever/supermimic_wheelbipe](https://github.com/RadiantForever/supermimic_wheelbipe)。本仓库基于该原项目开发，保留原项目的工作并继续维护 MJLab 迁移版本。
+
 把 [SuperMimic](https://github.com/zita-ch/supermimic_vibed) 的训练范式搬到 wheelbipe 轮腿机器人上，训练过程不跑 PPO。
 
 1. 仿真器采 5~15 s 的指令序列进 buffer，正常和失败样本都收；
